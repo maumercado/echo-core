@@ -9,6 +9,7 @@ public actor MicrophoneCaptureService: AudioCapturing {
     private let eventContinuation: AsyncStream<AudioCaptureEvent>.Continuation
     private var audioEngine: AVAudioEngine?
     private var hasInstalledTap = false
+    private var observerTokens: [NSObjectProtocol] = []
 
     public init() {
         let stream = AsyncStream.makeStream(
@@ -55,7 +56,7 @@ public actor MicrophoneCaptureService: AudioCapturing {
     }
 
     public func stop() async {
-        guard state == .recording else {
+        guard state == .recording || state == .interrupted else {
             return
         }
 
@@ -117,9 +118,12 @@ public actor MicrophoneCaptureService: AudioCapturing {
             )
         }
 
+        installObservers(for: engine)
     }
 
     private func tearDownEngine() {
+        removeObservers()
+
         guard let audioEngine else {
             return
         }
@@ -136,6 +140,128 @@ public actor MicrophoneCaptureService: AudioCapturing {
     private func transition(to newState: AudioCaptureState) {
         state = newState
         eventContinuation.yield(.stateChanged(newState))
+    }
+
+    private func installObservers(for engine: AVAudioEngine) {
+        let notificationCenter = NotificationCenter.default
+        let continuation = eventContinuation
+
+        observerTokens.append(
+            notificationCenter.addObserver(
+                forName: .AVAudioEngineConfigurationChange,
+                object: engine,
+                queue: nil
+            ) { _ in
+                continuation.yield(.routeChanged)
+            }
+        )
+
+        #if os(iOS)
+        let session = AVAudioSession.sharedInstance()
+
+        observerTokens.append(
+            notificationCenter.addObserver(
+                forName: AVAudioSession.routeChangeNotification,
+                object: session,
+                queue: nil
+            ) { _ in
+                continuation.yield(.routeChanged)
+            }
+        )
+
+        observerTokens.append(
+            notificationCenter.addObserver(
+                forName: AVAudioSession.interruptionNotification,
+                object: session,
+                queue: nil
+            ) { [weak self] notification in
+                guard
+                    let rawType = notification.userInfo?[
+                        AVAudioSessionInterruptionTypeKey
+                    ] as? UInt,
+                    let interruptionType = AVAudioSession.InterruptionType(
+                        rawValue: rawType
+                    )
+                else {
+                    return
+                }
+
+                let interruption: AudioCaptureInterruption
+
+                switch interruptionType {
+                case .began:
+                    interruption = .began
+                case .ended:
+                    let rawOptions = notification.userInfo?[
+                        AVAudioSessionInterruptionOptionKey
+                    ] as? UInt ?? 0
+                    let options = AVAudioSession.InterruptionOptions(
+                        rawValue: rawOptions
+                    )
+                    interruption = .ended(
+                        shouldResume: options.contains(.shouldResume)
+                    )
+                @unknown default:
+                    return
+                }
+
+                Task {
+                    await self?.handleInterruption(interruption)
+                }
+            }
+        )
+        #endif
+    }
+
+    private func removeObservers() {
+        let notificationCenter = NotificationCenter.default
+        observerTokens.forEach {
+            notificationCenter.removeObserver($0)
+        }
+        observerTokens.removeAll()
+    }
+
+    private func handleInterruption(
+        _ interruption: AudioCaptureInterruption
+    ) {
+        eventContinuation.yield(.interruption(interruption))
+
+        switch interruption {
+        case .began:
+            guard state == .recording else {
+                return
+            }
+
+            audioEngine?.pause()
+            transition(to: .interrupted)
+
+        case let .ended(shouldResume):
+            guard state == .interrupted else {
+                return
+            }
+
+            guard shouldResume else {
+                tearDownEngine()
+                deactivatePlatformAudioSession()
+                transition(to: .idle)
+                return
+            }
+
+            do {
+                try configurePlatformAudioSession()
+                guard let audioEngine else {
+                    throw AudioCaptureError.unavailableInput
+                }
+                try audioEngine.start()
+                transition(to: .recording)
+            } catch {
+                let captureError = mapToCaptureError(error)
+                eventContinuation.yield(.failed(captureError))
+                tearDownEngine()
+                deactivatePlatformAudioSession()
+                transition(to: .idle)
+            }
+        }
     }
 
     private func requestMicrophonePermission() async -> Bool {

@@ -29,6 +29,7 @@ public enum AudioCaptureState: Equatable, Sendable {
     case idle
     case starting
     case recording
+    case interrupted
     case stopping
 }
 
