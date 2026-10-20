@@ -20,6 +20,7 @@ macOS application must also enable the Audio Input capability.
 
 - `AudioNexusCore`: platform-neutral PCM value types.
 - `AudioNexusCapture`: microphone capture and format conversion.
+- `AudioNexusTranscription`: transcription contracts and verified model storage.
 
 Native transcription, denoising, and speech synthesis will remain separate
 products so applications only link the capabilities they use.
@@ -84,6 +85,18 @@ try await store.cleanupRecordings(
     olderThan: Date(timeIntervalSinceNow: -86_400)
 )
 ```
+
+## Transcription models
+
+`TranscriptionModelStore` installs models under Application Support. Every
+model descriptor supplies an expected SHA-256 checksum, and installation does
+not publish the model file until its size and checksum pass validation.
+Network downloads require HTTPS.
+
+The package currently defines the `SpeechTranscribing` boundary but does not
+select or bundle a Whisper engine or model. That choice remains gated on
+current-Xcode compilation and memory, latency, and accuracy measurements on
+supported Apple Silicon devices.
 
 ## Development
 

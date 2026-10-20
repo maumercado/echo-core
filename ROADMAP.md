@@ -30,10 +30,12 @@ record → transcribe → persist transcript → delete recording.
 
 ## 0.3 — Local transcription
 
-- Benchmark practical Whisper model sizes on the oldest supported devices.
-- Add model version, checksum, download, and deletion management.
-- Keep model files out of Git and out of the package binary.
-- Expose transcription independently from capture.
+- [ ] Benchmark practical Whisper model sizes on supported devices.
+- [x] Add model identity, checksum, download, and deletion management.
+- [x] Keep model files out of Git and out of the package binary.
+- [x] Expose transcription independently from capture.
+- [ ] Add the selected local Whisper engine behind `SpeechTranscribing`.
+- [ ] Verify English, Spanish, and Italian language detection.
 
 Completion means English, Spanish, and Italian meetings can be transcribed
 offline with measured memory usage and latency.

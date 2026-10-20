@@ -17,11 +17,19 @@ let package = Package(
             name: "AudioNexusCapture",
             targets: ["AudioNexusCapture"]
         ),
+        .library(
+            name: "AudioNexusTranscription",
+            targets: ["AudioNexusTranscription"]
+        ),
     ],
     targets: [
         .target(name: "AudioNexusCore"),
         .target(
             name: "AudioNexusCapture",
+            dependencies: ["AudioNexusCore"]
+        ),
+        .target(
+            name: "AudioNexusTranscription",
             dependencies: ["AudioNexusCore"]
         ),
         .testTarget(
@@ -31,6 +39,10 @@ let package = Package(
         .testTarget(
             name: "AudioNexusCaptureTests",
             dependencies: ["AudioNexusCapture"]
+        ),
+        .testTarget(
+            name: "AudioNexusTranscriptionTests",
+            dependencies: ["AudioNexusTranscription"]
         ),
     ]
 )
