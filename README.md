@@ -1,84 +1,152 @@
 # AudioNexus
 
-AudioNexus is a private Swift package for reusable, on-device audio capture and
-processing on current Apple platforms. The first release focuses on reliable
-microphone capture and emits little-endian, signed 16-bit, 16 kHz mono PCM
-frames suitable for speech transcription.
+AudioNexus is a Swift 6 package for reusable, privacy-oriented audio foundations
+in Apple-platform applications. It captures microphone audio, normalizes it to
+transcription-ready PCM, safely stages temporary WAV recordings, defines a
+local-transcription boundary, and manages integrity-checked model files.
 
-## Requirements
+The package is intentionally not a complete transcription or meeting-notes
+product. It does not currently include Whisper inference, RNNoise,
+ScreenCaptureKit system-audio capture, speech synthesis, transcript storage, or
+application UI.
 
-- Apple Silicon Mac
-- Current stable Xcode
+## Platform support
+
+- Apple Silicon (arm64) hosts and devices
 - macOS 27 or later
 - iOS 27 or later
-- Swift 6 language mode
+- Swift 6 with the current stable Xcode
 
-The host application must provide `NSMicrophoneUsageDescription`. A sandboxed
-macOS application must also enable the Audio Input capability.
+The declared package deployment targets are macOS 27 and iOS 27. Apple
+frameworks used by capture (`AVFoundation`/`AVFAudio`) make the capture product
+Apple-only. Device and current-Xcode verification is still outstanding; see
+[Verification](#verification).
 
-## Products
+## Products and architecture
 
-- `AudioNexusCore`: platform-neutral PCM value types.
-- `AudioNexusCapture`: microphone capture and format conversion.
-- `AudioNexusTranscription`: transcription contracts and verified model storage.
+The products form one-way dependency layers:
 
-Native transcription, denoising, and speech synthesis will remain separate
-products so applications only link the capabilities they use.
+```text
+AudioNexusCore
+    ↑              ↑
+AudioNexusCapture  AudioNexusTranscription
+```
 
-## Usage
+- **`AudioNexusCore`** — platform-neutral `AudioPCMFormat` and `AudioFrame`
+  values. The canonical transcription format is little-endian signed 16-bit,
+  16 kHz, mono PCM.
+- **`AudioNexusCapture`** — microphone permission, `AVAudioEngine` capture,
+  format conversion, ordered frame events, interruption/route events, and
+  temporary PCM WAV recording.
+- **`AudioNexusTranscription`** — language/request/result types,
+  `SpeechTranscribing`, and verified model storage. It provides no inference
+  implementation.
+
+Capture and transcription are separate products so a host links only what it
+uses. The package has no third-party dependencies.
+
+## Capture API and lifecycle
+
+`MicrophoneCaptureService` is an actor. Subscribe before starting so state and
+frame events are not missed:
 
 ```swift
 import AudioNexusCapture
 
-let captureService = MicrophoneCaptureService()
-let events = await captureService.events()
+let capture = MicrophoneCaptureService()
+let events = await capture.events()
 
 let eventTask = Task {
     for await event in events {
         switch event {
         case let .frame(frame):
-            // Consume frame.pcmData without blocking the capture callback.
-            print("Received \(frame.frameCount) frames")
+            // Hand off promptly; do not block audio processing.
+            print("\(frame.sequenceNumber): \(frame.frameCount) frames")
+        case let .stateChanged(state):
+            print("Capture state: \(state)")
+        case let .interruption(interruption):
+            print("Interruption: \(interruption)")
+        case .routeChanged:
+            print("Audio route changed")
         case let .failed(error):
             print("Capture failed: \(error)")
-        default:
-            break
         }
     }
 }
 
-try await captureService.start()
+try await capture.start() // Uses AudioCaptureConfiguration.transcription.
 
 // Later:
-await captureService.stop()
+await capture.stop()
 eventTask.cancel()
 ```
 
-The event stream retains at most 64 pending events. Consumers should process
-or hand off frames promptly so stale audio is not dropped.
+The stream buffers the newest 64 events. If a consumer falls behind, older
+pending events—including frames—can be dropped. Move frame work off the event
+loop promptly.
 
-## Temporary WAV lifecycle
+The capture state machine is:
 
-`TemporaryRecordingStore` creates writers in an application cache directory.
-Finalization rewrites the WAV header, closes and synchronizes the file, then
-renames it from `.partial` to `.wav` on the same filesystem.
+```text
+idle --start--> starting
+starting --engine ready--> recording
+starting --failure--> idle
+recording --stop--> stopping --teardown--> idle
+recording --iOS interruption begins--> interrupted
+interrupted --stop--> stopping
+interrupted --resume succeeds--> recording
+interrupted --resume declined or fails--> idle
+```
+
+`start` is valid only from `idle`; setup failure emits `.failed`, tears down,
+returns to `idle`, and throws. `stop` transitions `recording` or `interrupted`
+through `stopping` to `idle`; it is a no-op in other states. On iOS, an
+interruption pauses capture and resumes only when the system says it should.
+Route/configuration changes emit `.routeChanged`; the host decides how to
+respond.
+
+## Recording-to-transcription data flow
+
+```text
+microphone
+  → AVAudioEngine input
+  → 16-bit / 16 kHz / mono AudioFrame values
+  → UUID.partial in Caches
+  → synchronized header + same-directory rename to UUID.wav
+  → host-provided SpeechTranscribing implementation
+  → host durably persists TranscriptionResult
+  → host explicitly deletes the temporary WAV
+```
+
+The writer state machine is `writing → finalized` or `writing → discarded`.
+Only `writing` accepts matching-format frames. `finalize()` rewrites the WAV
+header, synchronizes and closes the file, then renames it from `.partial` to
+`.wav`. An append/finalization file error discards the partial file. A finalized
+file remains until the host removes it.
+
+Example orchestration (the persistence and transcriber are host-owned):
 
 ```swift
+import AudioNexusCapture
+import AudioNexusTranscription
+
 let store = try TemporaryRecordingStore()
 let writer = try await store.makeWriter()
 
-// Append each frame received from MicrophoneCaptureService.
+// For each .frame received from MicrophoneCaptureService:
 try await writer.append(frame)
 
 let recording = try await writer.finalize()
+let request = TranscriptionRequest(audioFileURL: recording.url)
+let result = try await transcriber.transcribe(request) // Host implementation.
 
-// Transcribe recording.url and durably save the transcript first.
-try await store.remove(recording)
+try await transcriptRepository.save(result)           // Must be durable.
+try await store.remove(recording)                      // Delete only afterward.
 ```
 
-The package does not guess whether transcription succeeded. The application
-must call `remove(_:)` only after its transcript is durable. On launch, the
-application can remove crash remnants with:
+If transcription or persistence fails, keep the WAV for retry or apply an
+explicit host retention policy. On launch, remove abandoned `.partial` and
+`.wav` files older than a chosen cutoff:
 
 ```swift
 try await store.cleanupRecordings(
@@ -86,24 +154,117 @@ try await store.cleanupRecordings(
 )
 ```
 
-## Transcription models
+## Transcription models and security
 
-`TranscriptionModelStore` installs models under Application Support. Every
-model descriptor supplies an expected SHA-256 checksum, and installation does
-not publish the model file until its size and checksum pass validation.
-Network downloads require HTTPS.
+`TranscriptionModelStore` keeps installed models in
+`Application Support/AudioNexus/Models` by default. A
+`TranscriptionModelDescriptor` requires a flat filename and a 64-digit SHA-256
+value; directory traversal and malformed checksums are rejected.
 
-The package currently defines the `SpeechTranscribing` boundary but does not
-select or bundle a Whisper engine or model. That choice remains gated on
-current-Xcode compilation and memory, latency, and accuracy measurements on
-supported Apple Silicon devices.
+Installation copies into a random `.partial` file, optionally checks the exact
+byte count, always computes SHA-256 in streaming chunks, and publishes the
+destination filename only after validation. An already-installed model is
+revalidated by default; a size/checksum mismatch removes the invalid installed
+copy. Downloads require HTTPS both initially and after redirects and require a
+successful HTTP status before installation. Removal is explicit.
 
-## Development
+The checksum must come from a trusted, pinned source: SHA-256 detects corruption
+or substitution relative to that value, but it is not a signature or a model
+provenance system. AudioNexus does not bundle a model, choose a model, implement
+custom TLS policy, or automatically download anything. Network access occurs
+only when the host calls `downloadAndInstall`.
 
-Open the package in the current stable Xcode and run the package test suite.
-Hardware microphone behavior must also be checked from a signed host
-application because package tests cannot exercise permission prompts or real
-audio-route changes reliably.
+## Privacy and offline assumptions
 
-The package intentionally has no third-party dependencies in its capture
-foundation.
+- Microphone frames and recordings stay on-device unless host code exports
+  them. AudioNexus contains no telemetry, analytics, cloud transcription, or
+  automatic upload path.
+- Capture and file staging require no network. A future local transcriber can
+  operate offline after its model is installed, but this repository does not
+  yet provide that transcriber.
+- Temporary recordings are ordinary files in the app's cache container, and
+  models are ordinary files in Application Support. The package adds no
+  application-level encryption or secure-delete guarantee.
+- The host owns transcript persistence, retention, backup policy, UI
+  disclosure, and the decision to delete recordings after durable save.
+
+## Host-app permissions and capabilities
+
+Every host must add a user-facing `NSMicrophoneUsageDescription` to its
+`Info.plist`.
+
+- **Sandboxed macOS:** enable App Sandbox **Audio Input**
+  (`com.apple.security.device.audio-input`). If the host downloads models,
+  enable outgoing network connections
+  (`com.apple.security.network.client`).
+- **iOS:** microphone access is prompted from the usage description. No extra
+  entitlement is needed for foreground recording. AudioNexus does not configure
+  background recording; a host that needs it must own and validate that
+  lifecycle and capability.
+
+The package writes only inside the host's cache/Application Support containers
+by default, so no broad file entitlement is required.
+
+## Repository layout
+
+```text
+Package.swift
+Sources/
+  AudioNexusCore/             PCM format and frame values
+  AudioNexusCapture/          capture, conversion, WAV writer/store
+  AudioNexusTranscription/    contracts, descriptors, checksum/model store
+Tests/
+  AudioNexusCoreTests/
+  AudioNexusCaptureTests/
+  AudioNexusTranscriptionTests/
+ROADMAP.md                    milestone status and deferred work
+```
+
+## Verification
+
+The test suite covers:
+
+- canonical PCM metadata and frame duration;
+- capture defaults and deterministic stereo 48 kHz float to mono 16 kHz
+  signed-PCM conversion;
+- WAV header/finalization, duration, explicit removal, and stale-file cleanup;
+- supported language selection, model filename validation, a standard SHA-256
+  vector, verified install/find/remove, and checksum rejection.
+
+This handoff was prepared in a Linux x86_64 environment with no Swift toolchain,
+Xcode, or Apple audio frameworks available. Consequently, the Swift suite was
+not run here. Run it in the current stable Xcode on supported macOS, then test
+from signed host apps on Apple Silicon Mac and physical iPhone hardware.
+Package tests alone cannot validate permission prompts, microphones, audio
+routes, or interruptions.
+
+## Scope status and next steps
+
+Implemented now: PCM types, microphone capture and conversion, bounded event
+delivery, capture/interruption lifecycle, temporary WAV finalization/cleanup,
+transcription contracts, language types, and checksum-verified model file
+management.
+
+Deferred: Whisper inference/model selection, measured multilingual detection,
+RNNoise, ScreenCaptureKit application/system audio, text-to-speech, and physical
+device validation. `ROADMAP.md` is the source of truth for milestone status.
+
+Concrete next steps:
+
+1. Build and run all tests with the current stable Xcode.
+2. Exercise repeated start/stop, denied permission, interruptions, route
+   changes, and cleanup in signed macOS and iOS host apps on physical hardware.
+3. Benchmark candidate local Whisper engines/models on supported Apple Silicon
+   for memory, latency, accuracy, and English/Spanish/Italian detection.
+4. Implement the selected engine behind `SpeechTranscribing`, then add
+   fixture-based inference tests without coupling it to capture.
+
+## Companion application boundaries
+
+**BriefScribe** may consume capture, recording, and transcription APIs, but it
+owns meeting UX, durable transcript/notes storage, retention policy, templates,
+prompting, and any local/cloud provider fallback.
+
+**MythosVox** owns speech-synthesis requirements, voices, presets, and fantasy
+pronunciation rules. Those concerns do not belong in AudioNexus until the app
+establishes a reusable API requirement.
